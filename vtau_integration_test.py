@@ -139,6 +139,12 @@ class Telemetry:
             msg = self.master.recv_match(blocking=False)
             if msg is None:
                 return
+            # MAVProxy and any other GCS link get forwarded onto this
+            # connection; their HEARTBEATs carry custom_mode 0
+            if msg.get_srcSystem() != self.master.target_system:
+                continue
+            if msg.get_srcComponent() != mavutil.mavlink.MAV_COMP_ID_AUTOPILOT1:
+                continue
             t = msg.get_type()
             if t in self.WANTED:
                 self.msgs[t] = msg
@@ -180,7 +186,7 @@ class Telemetry:
         return None
 
     def mode(self):
-        hb = self.get('HEARTBEAT')
+        hb = self.get('HEARTBEAT', 3.0)
         return hb.custom_mode if hb is not None else None
 
     def throttle_pwm(self):
@@ -320,7 +326,9 @@ def variable_tau_hdot(agl_m, vg_mps):
 # ----------------------------------------------------------------------------
 def main():
     print(f'Connecting to {CFG.connection}...')
-    master = mavutil.mavlink_connection(CFG.connection)
+    master = mavutil.mavlink_connection(
+        CFG.connection, source_system=1,
+        source_component=mavutil.mavlink.MAV_COMP_ID_ONBOARD_COMPUTER)
     master.wait_heartbeat()
     print(f'Heartbeat from system {master.target_system}')
 
@@ -359,10 +367,15 @@ def main():
                 break
             # pilot changed mode out of GUIDED some other way: stand down
             if mode is not None and mode != MODE_GUIDED:
-                print(f'External mode change (custom_mode {mode}), '
-                      'standing down')
-                state = 'ABORT'
-                break
+                if non_guided_since is None:
+                    non_guided_since = now
+                elif now - non_guided_since >= 1.5:
+                    print(f'External mode change (custom_mode {mode}), '
+                          'standing down')
+                    state = 'ABORT'
+                    break
+            else:
+                non_guided_since = None
 
         if state == 'WAIT_APPROACH':
             mc = telem.get('MISSION_CURRENT')
