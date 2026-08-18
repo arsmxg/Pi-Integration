@@ -3,7 +3,7 @@ import time
 from pymavlink import mavutil
 
 # might be 5762
-connection_string = 'tcp:127.0.0.1:5760'
+connection_string = 'tcp:127.0.0.1:5762'
 print(f"Connecting to SITL at {connection_string}...")
 master = mavutil.mavlink_connection(connection_string)
 
@@ -24,7 +24,7 @@ def send_vz_command(master, vz):
     # send sink rate targets
     # Bitmask to indicate which fields should be ignored by the vehicle.
     # 3559 (0b110111100111) enables Velocity and ignores Position, Acceleration, and Yaw.
-    type_mask = 3559 
+    type_mask = 3551 
     
     master.mav.set_position_target_local_ned_send(
         0,                                   # time_boot_ms (not used)
