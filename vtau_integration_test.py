@@ -121,11 +121,17 @@ class Telemetry:
     }
 
     def __init__(self, master):
+        """Initialize the telemetry cache.
+
+        Args:
+            master: mavutil MAVLink connection instance.
+        """
         self.master = master
         self.msgs = {}
         self.stamps = {}
 
     def request_streams(self):
+        """Request required MAVLink telemetry message streams from the autopilot at 10 Hz."""
         for name, msgid in self.WANTED.items():
             if name == 'HEARTBEAT':
                 continue
@@ -135,6 +141,11 @@ class Telemetry:
                 msgid, 1e6 / 10.0, 0, 0, 0, 0, 0)
 
     def pump(self):
+        """Read and cache incoming MAVLink messages in a non-blocking loop.
+
+        Filters messages to ensure they originate from the targeted autopilot
+        (ignoring GCS/MAVProxy heartbeats) and caches WANTED message types with timestamps.
+        """
         while True:
             msg = self.master.recv_match(blocking=False)
             if msg is None:
@@ -151,6 +162,15 @@ class Telemetry:
                 self.stamps[t] = time.time()
 
     def get(self, name, max_age=None):
+        """Retrieve the latest cached message of a given type.
+
+        Args:
+            name (str): MAVLink message type name (e.g., 'ATTITUDE', 'VFR_HUD').
+            max_age (float, optional): Maximum age in seconds before message is considered stale.
+
+        Returns:
+            mavlink message object or None if absent or expired.
+        """
         msg = self.msgs.get(name)
         if msg is None:
             return None
@@ -160,23 +180,29 @@ class Telemetry:
 
     # -- derived quantities ---------------------------------------------------
     def agl(self):
-        """Tilt-corrected rangefinder AGL, falling back to relative_alt."""
-        att = self.get('ATTITUDE', 0.5)
-        tilt = 1.0
-        if att is not None:
-            tilt = max(0.3, math.cos(att.roll) * math.cos(att.pitch))
-        rf = self.get('RANGEFINDER', 0.5)
-        if rf is not None and rf.distance > 0.01:
-            return rf.distance * tilt
-        ds = self.get('DISTANCE_SENSOR', 0.5)
-        if ds is not None and ds.current_distance > 1:
-            return (ds.current_distance / 100.0) * tilt
-        gpi = self.get('GLOBAL_POSITION_INT')
+        """Get the filtered EKF altitude above ground/home in meters.
+
+        Uses the EKF's fused state estimate from GLOBAL_POSITION_INT.relative_alt.
+        Directly querying the EKF avoids algebraic pitch-attitude coupling (where
+        flaring up causes geometric cos(pitch) shrinkage, falsely indicating a lower
+        AGL and triggering pitch-induced oscillations).
+
+        Returns:
+            float: EKF estimated relative altitude in meters, or None if unavailable.
+        """
+        gpi = self.get('GLOBAL_POSITION_INT', 1.0)
         if gpi is not None:
             return gpi.relative_alt / 1000.0
         return None
 
     def groundspeed(self):
+        """Get the current groundspeed in meters per second.
+
+        Extracts groundspeed from VFR_HUD or derives it from GLOBAL_POSITION_INT velocity vectors.
+
+        Returns:
+            float: Current groundspeed in m/s, or None if unavailable.
+        """
         hud = self.get('VFR_HUD', 1.0)
         if hud is not None:
             return hud.groundspeed
@@ -186,10 +212,22 @@ class Telemetry:
         return None
 
     def mode(self):
+        """Get the current custom flight mode number from the autopilot HEARTBEAT.
+
+        Returns:
+            int: Custom flight mode ID (e.g. 10 for AUTO, 15 for GUIDED), or None.
+        """
         hb = self.get('HEARTBEAT', 3.0)
         return hb.custom_mode if hb is not None else None
 
     def throttle_pwm(self):
+        """Get the pilot's transmitter throttle channel PWM value.
+
+        Used for pilot go-around detection during automated flare/rollout.
+
+        Returns:
+            int: Throttle channel PWM in microseconds (typically 1000-2000), or None.
+        """
         rc = self.get('RC_CHANNELS', 1.0)
         if rc is None:
             return None
@@ -200,8 +238,25 @@ class Telemetry:
 # Mission geometry
 # ----------------------------------------------------------------------------
 def download_centerline(master):
-    """Return (track_rad, land_lat_deg, land_lon_deg, land_seq) from the
-    approach waypoint -> NAV_LAND leg of the loaded mission."""
+    """Download the autopilot mission and determine runway centerline geometry.
+
+    Fetches all mission items, locates the NAV_LAND waypoint and its immediate
+    preceding NAV_WAYPOINT, then computes the approach track bearing (radians)
+    and touchdown coordinate references.
+
+    Args:
+        master: MAVLink connection instance.
+
+    Returns:
+        tuple: (track_rad, land_lat_deg, land_lon_deg, land_seq)
+            - track_rad (float): Runway centerline heading in radians.
+            - land_lat_deg (float): Latitude of the NAV_LAND point in degrees.
+            - land_lon_deg (float): Longitude of the NAV_LAND point in degrees.
+            - land_seq (int): Mission sequence index of the NAV_LAND command.
+
+    Raises:
+        RuntimeError: If mission download times out or required waypoints are missing.
+    """
     print('Downloading mission...')
     master.waypoint_request_list_send()
     count = master.recv_match(type='MISSION_COUNT', blocking=True, timeout=5)
@@ -244,8 +299,22 @@ def download_centerline(master):
 
 
 def cross_track_m(lat_deg, lon_deg, track_rad, ref_lat_deg, ref_lon_deg):
-    """Signed cross-track distance from the centerline through the land point.
-    Positive = right of track when looking along the approach direction."""
+    """Compute signed cross-track distance in meters from runway centerline.
+
+    Uses equirectangular projection centered on the landing threshold reference.
+
+    Args:
+        lat_deg (float): Aircraft current latitude in degrees.
+        lon_deg (float): Aircraft current longitude in degrees.
+        track_rad (float): Runway centerline heading in radians.
+        ref_lat_deg (float): Reference touchdown point latitude in degrees.
+        ref_lon_deg (float): Reference touchdown point longitude in degrees.
+
+    Returns:
+        float: Signed cross-track error in meters.
+               Positive indicates the aircraft is to the right of centerline
+               when facing along the approach direction.
+    """
     ref_lat = math.radians(ref_lat_deg)
     dn = (lat_deg - ref_lat_deg) * math.pi / 180.0 * R_EARTH
     de = (lon_deg - ref_lon_deg) * math.pi / 180.0 * R_EARTH * math.cos(ref_lat)
@@ -259,21 +328,51 @@ def cross_track_m(lat_deg, lon_deg, track_rad, ref_lat_deg, ref_lon_deg):
 # ----------------------------------------------------------------------------
 def cmd_int(master, command, p1=0, p2=0, p3=0, p4=0, x=0, y=0, z=0,
             frame=mavutil.mavlink.MAV_FRAME_GLOBAL):
+    """Send a MAVLink COMMAND_INT packet to the autopilot.
+
+    Helper function wrapping `command_int_send` for offboard guided control commands.
+
+    Args:
+        master: MAVLink connection instance.
+        command (int): MAVLink command ID (MAV_CMD enum).
+        p1-p4 (float): Command-specific parameters 1 to 4.
+        x, y (int): Scaled coordinate values (e.g. latitude/longitude * 1e7) if applicable.
+        z (float): Altitude or z-axis parameter.
+        frame (int): Coordinate frame (e.g., MAV_FRAME_GLOBAL, MAV_FRAME_GLOBAL_RELATIVE_ALT).
+    """
     master.mav.command_int_send(
         master.target_system, master.target_component,
         frame, command, 0, 0, p1, p2, p3, p4, x, y, z)
 
 
 def send_course(master, course_deg):
+    """Command the autopilot's ground-course heading in GUIDED mode.
+
+    Sends MAV_CMD_GUIDED_CHANGE_HEADING with course-over-ground mode (COG)
+    and lateral acceleration limits to prevent excessive bank angles during flare.
+
+    Args:
+        master: MAVLink connection instance.
+        course_deg (float): Desired ground course heading in degrees (0-360).
+    """
     cmd_int(master, mavutil.mavlink.MAV_CMD_GUIDED_CHANGE_HEADING,
             p1=HEADING_TYPE_COG, p2=course_deg % 360.0,
             p3=CFG.hdg_accel_limit)
 
 
 def send_height_rate(master, rel_alt_m, hdot_mps):
-    """Command TECS height demand to slew downward at |hdot| m/s.
-    The 4.5.6 handler resets its slew origin to current altitude on every
-    accept, so resending each cycle yields a continuous height-rate demand."""
+    """Command TECS altitude slew downward at a desired sink rate (|hdot| m/s).
+
+    Uses MAV_CMD_GUIDED_CHANGE_ALTITUDE with param3 specifying the height slew rate.
+    Because ArduPlane resets its slew origin on every accepted command, continuously
+    transmitting a target below current altitude transforms this into an effective
+    vertical sink rate interface to TECS.
+
+    Args:
+        master: MAVLink connection instance.
+        rel_alt_m (float): Current relative altitude in meters.
+        hdot_mps (float): Desired vertical sink rate in m/s (negative for descent).
+    """
     target = rel_alt_m - 5.0
     # handler rejects z == 0.0 and z == -1.0 exactly
     if abs(target) < 0.05:
@@ -286,11 +385,28 @@ def send_height_rate(master, rel_alt_m, hdot_mps):
 
 
 def send_airspeed(master, aspd_mps):
+    """Set the target equivalent airspeed demand in GUIDED mode.
+
+    Uses MAV_CMD_GUIDED_CHANGE_SPEED to throttle down to approach/flare airspeed
+    (AIRSPEED_MIN + margin) so TECS executes the descent near idle throttle.
+
+    Args:
+        master: MAVLink connection instance.
+        aspd_mps (float): Demanded airspeed target in m/s.
+    """
     cmd_int(master, mavutil.mavlink.MAV_CMD_GUIDED_CHANGE_SPEED,
             p1=SPEED_TYPE_AIRSPEED, p2=aspd_mps, p3=0)
 
 
 def set_mode(master, mode):
+    """Request the autopilot switch to a specific custom flight mode.
+
+    Sends MAV_CMD_DO_SET_MODE with MAV_MODE_FLAG_CUSTOM_MODE_ENABLED.
+
+    Args:
+        master: MAVLink connection instance.
+        mode (int): Custom flight mode number (e.g. MODE_GUIDED=15, MODE_TAKEOFF=13).
+    """
     master.mav.command_long_send(
         master.target_system, master.target_component,
         mavutil.mavlink.MAV_CMD_DO_SET_MODE, 0,
@@ -299,6 +415,16 @@ def set_mode(master, mode):
 
 
 def fetch_param(master, name, timeout=2.0):
+    """Request and read a named parameter value from the autopilot over MAVLink.
+
+    Args:
+        master: MAVLink connection instance.
+        name (str): Autopilot parameter name (e.g., 'AIRSPEED_MIN', 'ARSPD_FBW_MIN').
+        timeout (float): Max wait time in seconds for PARAM_VALUE response.
+
+    Returns:
+        float: Parameter value if received, or None on timeout.
+    """
     master.mav.param_request_read_send(
         master.target_system, master.target_component,
         name.encode('ascii'), -1)
@@ -314,6 +440,25 @@ def fetch_param(master, name, timeout=2.0):
 # Flare law
 # ----------------------------------------------------------------------------
 def variable_tau_hdot(agl_m, vg_mps):
+    """Calculate target vertical sink rate (hdot) using the Variable-Tau guidance law.
+
+    Implements:
+        tau  = tau_o * (v_go / V_g)      # Velocity-scaled time constant
+        h_B  = tau * td_sink             # Touchdown bias altitude
+        hdot = -(h_AGL + h_B) / tau      # Commanded descent sink rate
+
+    Clamps groundspeed to [vg_min, vg_max] and clamps output sink rate
+    between -td_sink (soft touchdown rate) and -sink_max (steepest descent limit).
+
+    Args:
+        agl_m (float): Current altitude above ground level in meters.
+        vg_mps (float): Current aircraft groundspeed in meters per second.
+
+    Returns:
+        tuple: (hdot_cmd, tau)
+            - hdot_cmd (float): Commanded vertical rate in m/s (negative for descent).
+            - tau (float): Instantaneous time constant in seconds.
+    """
     vg = min(max(vg_mps, CFG.vg_min), CFG.vg_max)
     tau = CFG.tau_o * CFG.v_go / vg
     h_b = tau * CFG.td_sink
@@ -325,6 +470,19 @@ def variable_tau_hdot(agl_m, vg_mps):
 # Main state machine
 # ----------------------------------------------------------------------------
 def main():
+    """Execute the companion-computer variable-tau flare integration loop.
+
+    Workflow:
+    1. Connects to the SITL MAVLink TCP endpoint and downloads the active landing mission.
+    2. Computes the runway centerline heading and landing threshold coordinates.
+    3. Requests high-rate telemetry and queries stall/minimum airspeed parameters.
+    4. Runs state machine transitions:
+       - WAIT_APPROACH: Monitors AUTO mission progression on final approach until AGL <= flare_engage_agl.
+       - FLARE: Switches to GUIDED mode, applies Variable-Tau sink rate demands to TECS, and tracks centerline.
+       - ROLLOUT: Below touchdown AGL, maintains hold-down altitude demand until groundspeed stops, then disarms.
+       - GO_AROUND: Triggers if pilot throttle stick exceeds threshold, immediately commanding TAKEOFF mode.
+       - ABORT: Stands down if pilot switches flight mode externally.
+    """
     print(f'Connecting to {CFG.connection}...')
     master = mavutil.mavlink_connection(
         CFG.connection, source_system=1,
@@ -346,6 +504,7 @@ def main():
     state = 'WAIT_APPROACH'
     last_cmd = 0.0
     last_print = 0.0
+    non_guided_since = None
     print('Waiting for AUTO landing approach '
           f'(engage at AGL <= {CFG.flare_engage_agl} m)...')
 
@@ -416,7 +575,7 @@ def main():
                 corr = math.asin(max(-0.5, min(v_close / max(vg, CFG.vg_min),
                                                0.5)))
                 corr = max(-math.radians(CFG.max_course_corr_deg),
-                           min(corr, math.radians(CFG.max_course_corr_deg)))
+                            min(corr, math.radians(CFG.max_course_corr_deg)))
                 send_course(master, math.degrees(track_rad + corr))
                 last_cmd = now
 
