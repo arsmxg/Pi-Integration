@@ -20,6 +20,16 @@ Key Concepts:
      Anchors the analytical exponential trajectory to the vehicle's live state
      (h_0, hdot_0) at the instant of GUIDED mode engagement, ensuring zero position
      step, zero velocity step, and acceleration bounded by TECS_VERT_ACC.
+  4. Mission-Aware Go-Around:
+     When full throttle is commanded, the script identifies MAV_CMD_DO_LAND_START
+     in the loaded mission plan, sets the active mission item to DO_LAND_START,
+     and transitions immediately to AUTO mode, allowing the aircraft to climb to
+     the planned altitude and cleanly repeat the landing circuit without orbit loops.
+  5. 30-Second Auto-Disarm Delay on Stop:
+     Once the aircraft completes rollout and comes to a full stop on the runway,
+     a 30-second countdown begins. If the pilot remains in GUIDED mode, the aircraft
+     automatically disarms after 30 seconds. If the pilot switches flight modes,
+     the auto-disarm is cancelled and the script stands down.
 """
 
 import math
@@ -44,10 +54,11 @@ class Config:
     default_td_sink: float = 0.30        # Target touchdown sink rate [m/s] (TECS_LAND_SINK)
     default_approach_speed: float = 15.0 # Nominal approach groundspeed [m/s]
 
-    # Termination & Rollout
+    # Termination, Rollout & Disarm
     touchdown_agl: float = 0.30          # Altitude declaring ground contact [m]
-    rollout_stop_gs: float = 2.0         # Groundspeed declaring rollout complete [m/s]
-    disarm_on_stop: bool = True          # Force-disarm after rollout (SITL)
+    rollout_stop_gs: float = 1.5         # Groundspeed declaring aircraft stopped [m/s]
+    auto_disarm_delay_s: float = 30.0    # Time after stopping before auto-disarm [s]
+    disarm_on_stop: bool = True          # Enable 30-second delayed auto-disarm
 
     # Lateral Guidance
     t_intercept: float = 4.0             # Cross-track closure time constant [s]
@@ -81,12 +92,13 @@ R_EARTH = 6378137.0
 # ----------------------------------------------------------------------------
 @dataclass
 class MissionApproachGeometry:
-    """Calculated geometry from the loaded autopilot mission."""
+    """Calculated geometry and waypoint references from the loaded autopilot mission."""
     track_rad: float                 # Runway centerline bearing [rad]
     track_deg: float                 # Runway centerline bearing [deg]
     approach_lat: float              # Waypoint before land [deg]
     approach_lon: float              # Waypoint before land [deg]
     approach_alt: float              # Waypoint before land altitude [m]
+    approach_wp_seq: int             # Mission sequence of waypoint before land
     land_lat: float                  # NAV_LAND waypoint latitude [deg]
     land_lon: float                  # NAV_LAND waypoint longitude [deg]
     land_alt: float                  # NAV_LAND waypoint altitude [m]
@@ -95,6 +107,9 @@ class MissionApproachGeometry:
     approach_alt_drop_m: float       # Vertical drop on approach leg [m]
     glideslope_deg: float            # Approach glide slope angle [deg]
     glideslope_gradient: float       # Glide slope gradient (tan gamma)
+    do_land_start_seq: Optional[int] # Sequence index of MAV_CMD_DO_LAND_START (if present)
+    do_land_start_next_seq: Optional[int] # First NAV waypoint after DO_LAND_START
+    takeoff_alt_m: Optional[float]   # Planned takeoff / climbout altitude [m]
 
 
 @dataclass
@@ -193,6 +208,13 @@ class Telemetry:
         hb = self.get('HEARTBEAT', 3.0)
         return hb.custom_mode if hb is not None else None
 
+    def is_armed(self) -> bool:
+        """Check if vehicle is currently armed."""
+        hb = self.get('HEARTBEAT', 3.0)
+        if hb is None:
+            return False
+        return bool(hb.base_mode & mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED)
+
     def throttle_pwm(self) -> Optional[int]:
         """Get RC transmitter throttle channel PWM value."""
         rc = self.get('RC_CHANNELS', 1.0)
@@ -227,7 +249,7 @@ def haversine_dist(lat1_deg: float, lon1_deg: float, lat2_deg: float, lon2_deg: 
 
 
 def extract_mission_geometry(master) -> MissionApproachGeometry:
-    """Download the autopilot mission and extract approach glideslope and centerline geometry."""
+    """Download the autopilot mission, locate DO_LAND_START, NAV_LAND, and approach geometry."""
     print('\n[1/3] Downloading mission from autopilot...')
     master.waypoint_request_list_send()
     count_msg = master.recv_match(type='MISSION_COUNT', blocking=True, timeout=5)
@@ -247,18 +269,28 @@ def extract_mission_geometry(master) -> MissionApproachGeometry:
         master.target_system, master.target_component,
         mavutil.mavlink.MAV_MISSION_ACCEPTED)
 
-    # Locate NAV_LAND
+    # 1. Search for DO_LAND_START item (command 189)
+    do_land_start_idx = next((i for i, w in enumerate(wps)
+                              if w.command == mavutil.mavlink.MAV_CMD_DO_LAND_START), None)
+    do_land_start_next_idx = (do_land_start_idx + 1) if (do_land_start_idx is not None and do_land_start_idx + 1 < len(wps)) else None
+
+    # 2. Search for NAV_TAKEOFF item (command 22) or read TKOFF_ALT param
+    takeoff_wp = next((w for w in wps if w.command == mavutil.mavlink.MAV_CMD_NAV_TAKEOFF), None)
+    takeoff_alt = takeoff_wp.z if takeoff_wp is not None else fetch_param(master, 'TKOFF_ALT')
+
+    # 3. Locate NAV_LAND
     land_idx = next((i for i, w in enumerate(wps)
                      if w.command == mavutil.mavlink.MAV_CMD_NAV_LAND), None)
     if land_idx is None or land_idx == 0:
         raise RuntimeError('Mission does not contain a NAV_LAND item with a preceding waypoint.')
 
-    # Locate immediate NAV_WAYPOINT before NAV_LAND
-    approach_wp = next((wps[i] for i in range(land_idx - 1, -1, -1)
-                        if wps[i].command == mavutil.mavlink.MAV_CMD_NAV_WAYPOINT), None)
-    if approach_wp is None:
+    # 4. Locate immediate NAV_WAYPOINT before NAV_LAND
+    approach_wp_idx = next((i for i in range(land_idx - 1, -1, -1)
+                            if wps[i].command == mavutil.mavlink.MAV_CMD_NAV_WAYPOINT), None)
+    if approach_wp_idx is None:
         raise RuntimeError('No NAV_WAYPOINT found before NAV_LAND in the mission plan.')
 
+    approach_wp = wps[approach_wp_idx]
     land_wp = wps[land_idx]
 
     lat1, lon1 = approach_wp.x / 1e7, approach_wp.y / 1e7
@@ -290,6 +322,7 @@ def extract_mission_geometry(master) -> MissionApproachGeometry:
         approach_lat=lat1,
         approach_lon=lon1,
         approach_alt=alt1,
+        approach_wp_seq=approach_wp_idx,
         land_lat=lat2,
         land_lon=lon2,
         land_alt=alt2,
@@ -298,13 +331,19 @@ def extract_mission_geometry(master) -> MissionApproachGeometry:
         approach_alt_drop_m=alt_drop,
         glideslope_deg=gs_deg,
         glideslope_gradient=gradient,
+        do_land_start_seq=do_land_start_idx,
+        do_land_start_next_seq=do_land_start_next_idx,
+        takeoff_alt_m=takeoff_alt,
     )
 
-    print(f' -> Mission Land Seq    : #{geom.land_seq}')
-    print(f' -> Approach Leg Dist   : {geom.approach_dist_m:.1f} m')
-    print(f' -> Approach Alt Drop   : {geom.approach_alt_drop_m:.1f} m')
-    print(f' -> Runway Track Bearing: {geom.track_deg:.1f} deg')
-    print(f' -> Approach Glideslope : {geom.glideslope_deg:.2f} deg ({geom.glideslope_gradient * 100:.1f}%)')
+    print(f' -> Mission Land Seq       : #{geom.land_seq}')
+    print(f' -> Approach Waypoint Seq  : #{geom.approach_wp_seq}')
+    print(f' -> DO_LAND_START Sequence : {"#" + str(geom.do_land_start_seq) if geom.do_land_start_seq is not None else "(none found)"}')
+    print(f' -> Planned Takeoff Alt    : {geom.takeoff_alt_m:.1f} m' if geom.takeoff_alt_m else ' -> Planned Takeoff Alt    : (default)')
+    print(f' -> Approach Leg Distance  : {geom.approach_dist_m:.1f} m')
+    print(f' -> Approach Alt Drop      : {geom.approach_alt_drop_m:.1f} m')
+    print(f' -> Runway Track Bearing   : {geom.track_deg:.1f} deg')
+    print(f' -> Approach Glideslope    : {geom.glideslope_deg:.2f} deg ({geom.glideslope_gradient * 100:.1f}%)')
     return geom
 
 
@@ -344,8 +383,6 @@ def build_dynamic_exponential_profile(master, geom: MissionApproachGeometry) -> 
     # Dynamic Flare Height Calculations:
     # ------------------------------------------------------------------------
     # Constraint A: Acceleration Bound (a_z(0) = |hdot_app| / tau <= max_vert_acc)
-    # tau_accel = |hdot_app| / max_vert_acc
-    # h_flare_accel = tau_accel * (|hdot_app| - |hdot_td|)
     tau_accel = abs(hdot_app) / max_vert_acc
     delta_sink = max(0.1, abs(hdot_app) - abs(hdot_td))
     h_flare_accel = tau_accel * delta_sink
@@ -501,6 +538,30 @@ def set_mode(master, mode: int):
     )
 
 
+def set_mission_current(master, seq: int):
+    """Set active mission item index over MAVLink."""
+    master.mav.mission_set_current_send(
+        master.target_system, master.target_component, seq
+    )
+
+
+def execute_go_around(master, geom: MissionApproachGeometry, thr_pwm: int):
+    """Execute a clean mission-aware go-around to DO_LAND_START in AUTO mode."""
+    if geom.do_land_start_seq is not None:
+        target_seq = geom.do_land_start_seq
+        print(f'\n[!] GO-AROUND (throttle {thr_pwm} us): Setting mission current to DO_LAND_START (seq #{target_seq}) -> Switching to AUTO mode')
+        set_mission_current(master, target_seq)
+        set_mode(master, MODE_AUTO)
+    elif geom.approach_wp_seq is not None:
+        target_seq = geom.approach_wp_seq
+        print(f'\n[!] GO-AROUND (throttle {thr_pwm} us): Setting mission current to approach WP (seq #{target_seq}) -> Switching to AUTO mode')
+        set_mission_current(master, target_seq)
+        set_mode(master, MODE_AUTO)
+    else:
+        print(f'\n[!] GO-AROUND (throttle {thr_pwm} us): No DO_LAND_START in mission -> Switching to AUTO mode')
+        set_mode(master, MODE_AUTO)
+
+
 # ----------------------------------------------------------------------------
 # Main Execution Loop
 # ----------------------------------------------------------------------------
@@ -535,8 +596,10 @@ def main():
     flare_start_time = None
     flare_h0 = None
     flare_hdot0 = None
+    stopped_start_time = None
     last_cmd_time = 0.0
     last_print_time = 0.0
+    last_countdown_print = 0.0
     non_guided_since = None
 
     print(f'\nWaiting for final approach (AUTO mode on mission seq #{geom.land_seq}, AGL <= {profile.h_flare:.1f} m)...')
@@ -551,20 +614,19 @@ def main():
         # --------------------------------------------------------------------
         # Pilot Authority: Go-Around & Mode Override Check
         # --------------------------------------------------------------------
-        if state in ('FLARE', 'ROLLOUT'):
+        if state in ('FLARE', 'ROLLOUT', 'STOPPED'):
             thr = telem.throttle_pwm()
             if thr is not None and thr > CFG.go_around_thr_pwm:
-                print(f'\n[!] GO-AROUND: Throttle {thr} us > {CFG.go_around_thr_pwm} us -> Switching to TAKEOFF')
-                set_mode(master, MODE_TAKEOFF)
+                execute_go_around(master, geom, thr)
                 state = 'GO_AROUND'
                 break
 
-            # If pilot manually changes flight mode out of GUIDED: Stand down
+            # If pilot manually changes flight mode out of GUIDED: Stand down immediately
             if mode is not None and mode != MODE_GUIDED:
                 if non_guided_since is None:
                     non_guided_since = now
-                elif now - non_guided_since >= 1.5:
-                    print(f'\n[!] External mode switch detected ({mode}). Standing down.')
+                elif now - non_guided_since >= 1.0:
+                    print(f'\n[!] External mode switch detected ({mode}). Auto-control stood down.')
                     state = 'ABORT'
                     break
             else:
@@ -649,7 +711,7 @@ def main():
                 state = 'ROLLOUT'
 
         # --------------------------------------------------------------------
-        # State: ROLLOUT
+        # State: ROLLOUT (Holding Ground Track until Stopped)
         # --------------------------------------------------------------------
         elif state == 'ROLLOUT':
             if (now - last_cmd_time) >= (1.0 / CFG.cmd_hz):
@@ -660,12 +722,55 @@ def main():
 
             gs = telem.groundspeed()
             if gs is not None and gs < CFG.rollout_stop_gs:
+                stopped_start_time = now
+                last_countdown_print = now
+                state = 'STOPPED'
+                print(f'\n[i] Aircraft stopped on runway (Vg: {gs:.1f} m/s).')
                 if CFG.disarm_on_stop:
-                    print('Rollout complete -> Force disarming (SITL)')
+                    print(f'[i] 30-second auto-disarm timer started. (Switching out of GUIDED mode cancels auto-disarm).')
+                else:
+                    state = 'DONE'
+
+        # --------------------------------------------------------------------
+        # State: STOPPED (30-Second Auto-Disarm Countdown in GUIDED Mode)
+        # --------------------------------------------------------------------
+        elif state == 'STOPPED':
+            if (now - last_cmd_time) >= (1.0 / CFG.cmd_hz):
+                # Keep holding 0.0m altitude demand and runway heading
+                send_target_altitude(master, 0.0)
+                send_course(master, geom.track_deg)
+                last_cmd_time = now
+
+            # Check if vehicle was already disarmed by pilot or autopilot
+            if not telem.is_armed():
+                print('\n[i] Vehicle disarmed. Landing workflow complete.')
+                state = 'DONE'
+                break
+
+            elapsed_stopped = now - stopped_start_time
+            remaining = max(0.0, CFG.auto_disarm_delay_s - elapsed_stopped)
+
+            # Print countdown status every 5 seconds
+            if (now - last_countdown_print) >= 5.0 and remaining > 0:
+                print(f'[i] Aircraft stopped in GUIDED mode. Auto-disarming in {remaining:.0f}s...')
+                last_countdown_print = now
+
+            # 30-second timer elapsed
+            if elapsed_stopped >= CFG.auto_disarm_delay_s:
+                if CFG.disarm_on_stop and mode == MODE_GUIDED:
+                    print(f'\n[!] 30 seconds elapsed after stop in GUIDED mode -> Disarming aircraft.')
                     master.mav.command_long_send(
                         master.target_system, master.target_component,
                         mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM, 0,
-                        0, 21196, 0, 0, 0, 0, 0)
+                        0, 0, 0, 0, 0, 0, 0)
+                    # Fallback force disarm if normal disarm is rejected on ground
+                    time.sleep(0.5)
+                    telem.pump()
+                    if telem.is_armed():
+                        master.mav.command_long_send(
+                            master.target_system, master.target_component,
+                            mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM, 0,
+                            0, 21196, 0, 0, 0, 0, 0)
                 state = 'DONE'
 
         time.sleep(1.0 / CFG.loop_hz)
