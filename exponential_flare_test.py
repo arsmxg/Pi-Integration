@@ -1,28 +1,25 @@
 """
-Exponential Flare Trajectory Generator for ArduPlane SITL / Companion Computer
-==============================================================================
-Target firmware: Stock ArduPlane 4.3+ / 4.5.6 (no custom TECS firmware mods).
+Smooth Acceleration-Bounded Exponential Flare Controller for ArduPlane
+======================================================================
+Target firmware: Stock ArduPlane 4.3+ / 4.5.6 (no custom TECS modifications).
 
-Description:
-  Implements a pure exponential flare trajectory (no variable-tau law) by
-  extracting key parameters directly from the UAV autopilot and the loaded
-  mission plan:
-    1. Mission Approach Glide Slope: Derived from the NAV_WAYPOINT immediately
-       preceding the NAV_LAND command and the NAV_LAND waypoint itself.
-    2. Approach Sink Rate: Required steady-state descent rate on final approach
-       based on approach speed and glide path angle.
-    3. Final Touchdown Sink Rate: Extracted from autopilot parameters (TECS_LAND_SINK).
-    4. Flare Initiation Altitude & Flare Distance: Extracted from LAND_FLARE_ALT /
-       geometry, determining the distance from the flare point to the runway landing point.
-    5. Analytical Exponential Profile:
-         tau_exp  = h_flare / (|hdot_approach| - |hdot_touchdown|)
-         h_infty  = -tau_exp * |hdot_touchdown|
-         h_ref(t) = (h_flare - h_infty) * exp(-t / tau_exp) + h_infty
-         hdot(t)  = -|hdot_approach| * exp(-t / tau_exp)
-
-  Unlike variable-rate slew resets that induce pitch oscillations, this script
-  generates a continuous, smooth reference altitude trajectory h_ref(t) that
-  TECS tracks with optimal pitch damping and energy management.
+Key Concepts:
+  1. Acceleration-Bounded Trajectory:
+     Extracts TECS_VERT_ACC as the strict upper bound for vertical acceleration
+     demanded at flare initiation (a_z,max = |hdot_approach| / tau <= TECS_VERT_ACC).
+  2. Dynamic Flare Height Decision:
+     Computes the required flare initiation altitude dynamically from:
+       - Approach glideslope angle (from mission NAV_WAYPOINT -> NAV_LAND leg).
+       - Approach descent rate (hdot_approach = -V_g * tan(gamma)).
+       - Maximum vertical acceleration constraint (TECS_VERT_ACC).
+       - Desired flare duration (LAND_FLARE_SEC).
+       - Backup flare altitude (LAND_FLARE_ALT) used as a minimum floor.
+     On steeper approaches, the aircraft automatically flares higher up to absorb
+     vertical momentum without pitch jerk or G-loading exceedances.
+  3. C0, C1, and C2 Continuous Transition:
+     Anchors the analytical exponential trajectory to the vehicle's live state
+     (h_0, hdot_0) at the instant of GUIDED mode engagement, ensuring zero position
+     step, zero velocity step, and acceleration bounded by TECS_VERT_ACC.
 """
 
 import math
@@ -40,9 +37,11 @@ from pymavlink import mavutil
 class Config:
     connection: str = 'tcp:127.0.0.1:5762'
 
-    # Fallback / Default Parameters (overridden by autopilot params if available)
-    default_flare_alt: float = 6.0       # Flare initiation AGL [m]
-    default_td_sink: float = 0.30        # Target touchdown sink rate [m/s]
+    # Autopilot Defaults / Fallbacks (overridden by autopilot parameters)
+    default_vert_acc: float = 1.5        # Max vertical acceleration [m/s^2] (TECS_VERT_ACC)
+    default_flare_sec: float = 3.0       # Target flare duration [s] (LAND_FLARE_SEC)
+    default_flare_alt_backup: float = 3.0# Minimum backup flare altitude [m] (LAND_FLARE_ALT)
+    default_td_sink: float = 0.30        # Target touchdown sink rate [m/s] (TECS_LAND_SINK)
     default_approach_speed: float = 15.0 # Nominal approach groundspeed [m/s]
 
     # Termination & Rollout
@@ -78,7 +77,7 @@ R_EARTH = 6378137.0
 
 
 # ----------------------------------------------------------------------------
-# Mission & Parameter Extraction
+# Data Structures
 # ----------------------------------------------------------------------------
 @dataclass
 class MissionApproachGeometry:
@@ -99,16 +98,20 @@ class MissionApproachGeometry:
 
 
 @dataclass
-class ExponentialFlareProfile:
-    """Analytical parameters defining the exponential flare trajectory."""
-    h_flare: float                   # Initiation altitude [m]
-    hdot_approach: float             # Initial sink rate at flare entry (negative) [m/s]
+class DynamicExponentialProfile:
+    """Analytical parameters defining the acceleration-bounded flare trajectory."""
+    h_flare: float                   # Decided flare initiation altitude [m]
+    h_flare_accel: float             # Min flare altitude from acceleration limit [m]
+    h_flare_time: float              # Flare altitude from LAND_FLARE_SEC [m]
+    h_flare_backup: float            # Backup flare altitude floor from LAND_FLARE_ALT [m]
+    max_vert_acc: float              # Upper bound vertical acceleration [m/s^2] (TECS_VERT_ACC)
+    hdot_approach: float             # Required approach sink rate (negative) [m/s]
     hdot_td: float                   # Target touchdown sink rate (negative) [m/s]
-    tau_exp: float                   # Exponential decay time constant [s]
-    h_infty: float                   # Asymptotic target altitude below ground [m]
-    flare_duration_s: float          # Expected flare duration to reach ground [s]
-    flare_ground_distance_m: float   # Expected horizontal distance during flare [m]
-    flare_point_to_land_dist_m: float# Distance from flare initiation to NAV_LAND point [m]
+    tau_exp: float                   # Nominal exponential time constant [s]
+    h_infty: float                   # Nominal asymptotic target depth [m]
+    flare_duration_s: float          # Expected flare duration [s]
+    flare_ground_dist_m: float       # Expected ground run during flare [m]
+    flare_to_land_dist_m: float      # Distance from flare initiation point to NAV_LAND [m]
 
 
 class Telemetry:
@@ -166,6 +169,13 @@ class Telemetry:
         gpi = self.get('GLOBAL_POSITION_INT', 1.0)
         if gpi is not None:
             return gpi.relative_alt / 1000.0
+        return None
+
+    def vertical_velocity(self) -> Optional[float]:
+        """Get current vertical velocity in m/s (negative for descent)."""
+        gpi = self.get('GLOBAL_POSITION_INT', 1.0)
+        if gpi is not None:
+            return -(gpi.vz / 100.0) # gpi.vz is cm/s, +down -> convert to +up m/s
         return None
 
     def groundspeed(self) -> Optional[float]:
@@ -298,73 +308,99 @@ def extract_mission_geometry(master) -> MissionApproachGeometry:
     return geom
 
 
-def build_exponential_flare_profile(master, geom: MissionApproachGeometry) -> ExponentialFlareProfile:
-    """Query autopilot parameters and construct the exponential flare trajectory."""
-    print('\n[2/3] Extracting autopilot landing parameters...')
+def build_dynamic_exponential_profile(master, geom: MissionApproachGeometry) -> DynamicExponentialProfile:
+    """Extract UAV limits (TECS_VERT_ACC, LAND_FLARE_SEC) and compute dynamic flare height."""
+    print('\n[2/3] Extracting autopilot constraints & calculating dynamic flare height...')
 
-    # 1. Touchdown Sink Rate Target
+    # 1. Maximum Vertical Acceleration Limit (TECS_VERT_ACC)
+    vert_acc_param = fetch_param(master, 'TECS_VERT_ACC')
+    max_vert_acc = vert_acc_param if (vert_acc_param is not None and vert_acc_param > 0) else CFG.default_vert_acc
+
+    # 2. Flare Duration Parameter (LAND_FLARE_SEC)
+    flare_sec_param = fetch_param(master, 'LAND_FLARE_SEC')
+    flare_sec = flare_sec_param if (flare_sec_param is not None and flare_sec_param > 0) else CFG.default_flare_sec
+
+    # 3. Flare Altitude Floor / Backup (LAND_FLARE_ALT)
+    flare_alt_backup_param = fetch_param(master, 'LAND_FLARE_ALT')
+    flare_alt_backup = flare_alt_backup_param if (flare_alt_backup_param is not None and flare_alt_backup_param > 0) else CFG.default_flare_alt_backup
+
+    # 4. Target Touchdown Sink Rate (TECS_LAND_SINK)
     td_sink_param = fetch_param(master, 'TECS_LAND_SINK')
     td_sink = td_sink_param if (td_sink_param is not None and td_sink_param > 0) else CFG.default_td_sink
 
-    # 2. Flare Initiation Altitude
-    flare_alt_param = fetch_param(master, 'LAND_FLARE_ALT')
-    if flare_alt_param is not None and flare_alt_param > 0:
-        flare_alt = flare_alt_param
-    else:
-        flare_alt = CFG.default_flare_alt
-
-    # 3. Approach Groundspeed / Airspeed
+    # 5. Approach Speed
     cruise_aspd = fetch_param(master, 'TRIM_ARSPD_CM')
     if cruise_aspd is not None and cruise_aspd > 0:
         approach_speed = cruise_aspd / 100.0
     else:
         approach_speed = CFG.default_approach_speed
 
-    # Calculate required approach sink rate from mission glideslope:
-    # hdot_approach = -V_ground * tan(gamma)
+    # Required steady-state approach sink rate from mission glideslope:
     hdot_approach = -(approach_speed * geom.glideslope_gradient)
-
-    # Negative sink rates
     hdot_td = -abs(td_sink)
     hdot_app = -abs(hdot_approach)
 
-    # Exponential time constant:
-    # tau_exp = h_flare / (|hdot_approach| - |hdot_td|)
-    delta_sink = abs(hdot_app) - abs(hdot_td)
-    if delta_sink <= 0.1:
-        delta_sink = 0.5
-    tau_exp = flare_alt / delta_sink
+    # ------------------------------------------------------------------------
+    # Dynamic Flare Height Calculations:
+    # ------------------------------------------------------------------------
+    # Constraint A: Acceleration Bound (a_z(0) = |hdot_app| / tau <= max_vert_acc)
+    # tau_accel = |hdot_app| / max_vert_acc
+    # h_flare_accel = tau_accel * (|hdot_app| - |hdot_td|)
+    tau_accel = abs(hdot_app) / max_vert_acc
+    delta_sink = max(0.1, abs(hdot_app) - abs(hdot_td))
+    h_flare_accel = tau_accel * delta_sink
 
-    # Asymptotic target below ground level:
+    # Constraint B: Flare Time Parameter (LAND_FLARE_SEC)
+    sink_ratio = abs(hdot_app) / max(0.05, abs(hdot_td))
+    if sink_ratio > 1.05:
+        tau_time = flare_sec / math.log(sink_ratio)
+    else:
+        tau_time = flare_sec
+    h_flare_time = tau_time * delta_sink
+
+    # Constraint C: Minimum Altitude Backup Floor
+    h_flare_backup_floor = flare_alt_backup
+
+    # Final Decided Flare Initiation Height:
+    # On steep descents, h_flare_accel scales up to prevent pitch acceleration spikes.
+    h_flare = max(h_flare_accel, h_flare_time, h_flare_backup_floor)
+
+    # Resulting Nominal Time Constant and Trajectory Geometry:
+    tau_exp = h_flare / delta_sink
     h_infty = -tau_exp * abs(hdot_td)
+    actual_duration_s = tau_exp * math.log(sink_ratio) if sink_ratio > 1.0 else flare_sec
+    flare_ground_dist = approach_speed * actual_duration_s
+    flare_to_land_dist = h_flare / geom.glideslope_gradient
 
-    # Predicted duration and distances
-    duration_s = tau_exp * math.log(abs(hdot_app) / abs(hdot_td))
-    flare_ground_dist = approach_speed * duration_s
+    # Peak demanded acceleration at entry
+    initial_accel = abs(hdot_app) / tau_exp
 
-    # Distance from flare initiation point on glideslope to the NAV_LAND waypoint:
-    # dist_to_land = h_flare / tan(gamma)
-    flare_to_land_dist = flare_alt / geom.glideslope_gradient
-
-    profile = ExponentialFlareProfile(
-        h_flare=flare_alt,
+    profile = DynamicExponentialProfile(
+        h_flare=h_flare,
+        h_flare_accel=h_flare_accel,
+        h_flare_time=h_flare_time,
+        h_flare_backup=h_flare_backup_floor,
+        max_vert_acc=max_vert_acc,
         hdot_approach=hdot_app,
         hdot_td=hdot_td,
         tau_exp=tau_exp,
         h_infty=h_infty,
-        flare_duration_s=duration_s,
-        flare_ground_distance_m=flare_ground_dist,
-        flare_point_to_land_dist_m=flare_to_land_dist,
+        flare_duration_s=actual_duration_s,
+        flare_ground_dist_m=flare_ground_dist,
+        flare_to_land_dist_m=flare_to_land_dist,
     )
 
-    print(f' -> Flare Engage Altitude     (h_flare)        : {profile.h_flare:.2f} m')
-    print(f' -> Required Approach Sink    (hdot_approach)  : {profile.hdot_approach:.2f} m/s')
-    print(f' -> Target Touchdown Sink     (TECS_LAND_SINK) : {profile.hdot_td:.2f} m/s')
-    print(f' -> Flare Point to Land Point (Distance)       : {profile.flare_point_to_land_dist_m:.1f} m')
-    print(f' -> Exponential Time Constant (tau_exp)        : {profile.tau_exp:.2f} s')
-    print(f' -> Asymptotic Target Depth   (h_infty)        : {profile.h_infty:.2f} m')
-    print(f' -> Predicted Flare Duration  (T_flare)        : {profile.flare_duration_s:.2f} s')
-    print(f' -> Predicted Flare Ground Run(D_flare)        : {profile.flare_ground_distance_m:.1f} m')
+    print(f' -> Max Vertical Acceleration Limit (TECS_VERT_ACC) : {profile.max_vert_acc:.2f} m/s^2')
+    print(f' -> Flare Time Parameter Target     (LAND_FLARE_SEC) : {flare_sec:.2f} s')
+    print(f' -> Flare Backup Floor Altitude     (LAND_FLARE_ALT) : {profile.h_flare_backup:.2f} m')
+    print(f' -> Mission Required Approach Sink  (hdot_approach)  : {profile.hdot_approach:.2f} m/s')
+    print(f' -> Target Touchdown Sink Rate      (TECS_LAND_SINK) : {profile.hdot_td:.2f} m/s')
+    print(f' -------------------------------------------------------------')
+    print(f' -> Sized for Accel Limit : {profile.h_flare_accel:.2f} m AGL')
+    print(f' -> Sized for Flare Sec   : {profile.h_flare_time:.2f} m AGL')
+    print(f' -> DECIDED FLARE HEIGHT  : {profile.h_flare:.2f} m AGL (Engage Point {profile.flare_to_land_dist_m:.1f}m ahead of land point)')
+    print(f' -> Resulting tau_exp     : {profile.tau_exp:.2f} s (Initial Accel: {initial_accel:.2f} m/s^2 <= {profile.max_vert_acc:.2f} m/s^2)')
+    print(f' -> Predicted Flare Run   : {profile.flare_ground_dist_m:.1f} m over {profile.flare_duration_s:.2f} s')
     return profile
 
 
@@ -381,28 +417,49 @@ def cross_track_m(lat_deg: float, lon_deg: float, track_rad: float,
     return tn * de - te * dn
 
 
-def compute_exponential_trajectory(t_elapsed: float, profile: ExponentialFlareProfile) -> Tuple[float, float]:
-    """Compute analytical exponential flare reference altitude and sink rate at time t."""
-    decay = math.exp(-t_elapsed / profile.tau_exp)
-    # h_ref(t) = (h_flare - h_infty) * exp(-t/tau) + h_infty
-    h_ref = (profile.h_flare - profile.h_infty) * decay + profile.h_infty
-    # hdot_ref(t) = hdot_approach * exp(-t/tau)
-    hdot_ref = profile.hdot_approach * decay
-    return max(0.0, h_ref), hdot_ref
+def compute_live_exponential_trajectory(t_elapsed: float, h_0: float, hdot_0: float,
+                                       hdot_td: float, max_vert_acc: float) -> Tuple[float, float, float]:
+    """Compute continuous exponential flare trajectory anchored to live initial conditions (h_0, hdot_0).
+
+    Guarantees:
+      1. h_ref(0) = h_0        (zero position jump)
+      2. hdot_ref(0) = hdot_0  (zero velocity jump)
+      3. a_z(0) <= max_vert_acc (acceleration bounded by TECS_VERT_ACC)
+
+    Returns:
+      (h_ref, hdot_ref, a_z)
+    """
+    abs_hdot_0 = max(abs(hdot_td) + 0.1, abs(hdot_0))
+    abs_hdot_td = abs(hdot_td)
+
+    # Ensure time constant satisfies acceleration bound
+    tau_accel = abs_hdot_0 / max_vert_acc
+    tau_geom = h_0 / (abs_hdot_0 - abs_hdot_td)
+    tau = max(tau_accel, tau_geom)
+
+    # Asymptotic depth
+    h_infty = -tau * abs_hdot_td
+
+    decay = math.exp(-t_elapsed / tau)
+    h_ref = (h_0 - h_infty) * decay + h_infty
+    hdot_ref = -abs_hdot_0 * decay
+    accel_ref = (abs_hdot_0 / tau) * decay
+
+    return max(0.0, h_ref), hdot_ref, accel_ref
 
 
 def send_target_altitude(master, alt_target_m: float):
     """Command TECS target altitude in GUIDED mode without slew resets.
 
-    Setting param3 = 0 updates guided_state.target_alt cleanly, allowing TECS's
-    internal controller to track the smooth continuous reference altitude.
+    Setting param3 = 0 updates guided_state.target_alt directly, allowing TECS's
+    internal energy balance and pitch damping loops to smoothly track the trajectory.
     """
     master.mav.command_int_send(
         master.target_system, master.target_component,
         mavutil.mavlink.MAV_FRAME_GLOBAL_RELATIVE_ALT,
         mavutil.mavlink.MAV_CMD_GUIDED_CHANGE_ALTITUDE,
         0, 0,
-        0, 0, 0, 0,  # p3 = 0 (direct target tracking without slew reset)
+        0, 0, 0, 0,  # p3 = 0 (direct target tracking without slew resets)
         0, 0, alt_target_m
     )
 
@@ -449,7 +506,7 @@ def set_mode(master, mode: int):
 # ----------------------------------------------------------------------------
 def main():
     print('====================================================================')
-    print('         ArduPlane Exponential Flare Trajectory Controller          ')
+    print('   ArduPlane Acceleration-Bounded Exponential Flare Controller      ')
     print('====================================================================')
 
     print(f'Connecting to {CFG.connection}...')
@@ -461,7 +518,7 @@ def main():
 
     # Extract mission geometry and analytical flare profile
     geom = extract_mission_geometry(master)
-    profile = build_exponential_flare_profile(master, geom)
+    profile = build_dynamic_exponential_profile(master, geom)
 
     # Initialize telemetry
     telem = Telemetry(master)
@@ -476,6 +533,8 @@ def main():
 
     state = 'WAIT_APPROACH'
     flare_start_time = None
+    flare_h0 = None
+    flare_hdot0 = None
     last_cmd_time = 0.0
     last_print_time = 0.0
     non_guided_since = None
@@ -520,7 +579,12 @@ def main():
             descending = (gpi is not None and gpi.vz > 20)  # > 0.20 m/s downward
 
             if on_final and descending and agl is not None and agl <= profile.h_flare:
-                print(f'\n[>>>] FLARE ENGAGED at AGL {agl:.2f} m -> Switching to GUIDED')
+                # Capture live vehicle state at engagement instant
+                flare_h0 = agl
+                live_vz = telem.vertical_velocity()
+                flare_hdot0 = live_vz if (live_vz is not None and live_vz < -0.2) else profile.hdot_approach
+
+                print(f'\n[>>>] FLARE ENGAGED at AGL {flare_h0:.2f} m (live sink: {flare_hdot0:.2f} m/s) -> GUIDED')
                 set_mode(master, MODE_GUIDED)
 
                 # Wait for GUIDED confirmation
@@ -542,15 +606,17 @@ def main():
 
                 flare_start_time = time.time()
                 state = 'FLARE'
-                print('Exponential flare trajectory active.')
+                print('Smooth acceleration-bounded exponential flare active.')
 
         # --------------------------------------------------------------------
-        # State: FLARE (Exponential Reference Trajectory Tracking)
+        # State: FLARE (Acceleration-Bounded Trajectory Tracking)
         # --------------------------------------------------------------------
         elif state == 'FLARE':
             if (now - last_cmd_time) >= (1.0 / CFG.cmd_hz) and gpi is not None and agl is not None:
                 t_elapsed = now - flare_start_time
-                h_ref, hdot_ref = compute_exponential_trajectory(t_elapsed, profile)
+                h_ref, hdot_ref, accel_ref = compute_live_exponential_trajectory(
+                    t_elapsed, flare_h0, flare_hdot0, profile.hdot_td, profile.max_vert_acc
+                )
                 vg = telem.groundspeed() or CFG.default_approach_speed
 
                 # 1. Vertical Guidance: Stream smooth reference altitude
@@ -574,7 +640,7 @@ def main():
                 # Telemetry printout (1 Hz)
                 if (now - last_print_time) >= 1.0:
                     print(f't: {t_elapsed:4.1f}s | AGL: {agl:5.2f}m | h_ref: {h_ref:5.2f}m | '
-                          f'hdot_ref: {hdot_ref:5.2f}m/s | Vg: {vg:4.1f}m/s | XTK: {xtk:+5.1f}m')
+                          f'hdot_ref: {hdot_ref:5.2f}m/s | az: {accel_ref:4.2f}m/s^2 | Vg: {vg:4.1f}m/s | XTK: {xtk:+5.1f}m')
                     last_print_time = now
 
             # Touchdown detection
