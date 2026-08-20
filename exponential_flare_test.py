@@ -20,12 +20,18 @@ Key Concepts:
      Anchors the analytical exponential trajectory to the vehicle's live state
      (h_0, hdot_0) at the instant of GUIDED mode engagement, ensuring zero position
      step, zero velocity step, and acceleration bounded by TECS_VERT_ACC.
-  4. Mission-Aware Go-Around:
-     When full throttle is commanded, the script identifies MAV_CMD_DO_LAND_START
-     in the loaded mission plan, sets the active mission item to DO_LAND_START,
-     and transitions immediately to AUTO mode, allowing the aircraft to climb to
-     the planned altitude and cleanly repeat the landing circuit without orbit loops.
-  5. 30-Second Auto-Disarm Delay on Stop:
+  4. Idle Throttle & Transparent Pilot Throttle Authority:
+     In GUIDED mode, sets commanded airspeed setpoint to 0.0 m/s (zero thrust request
+     to TECS). Does NOT override RC channels, ensuring the autopilot continuously reports
+     the pilot's real physical transmitter throttle position.
+  5. Mission-Aware Go-Around:
+     When the pilot advances throttle (PWM > go_around_thr_pwm), the script instantly:
+       - Identifies the navigational waypoint immediately AFTER MAV_CMD_DO_LAND_START.
+       - Sets the active mission waypoint to that waypoint index.
+       - Switches flight mode back to AUTO mode.
+       - The aircraft spools up immediately, climbs to the planned altitude, and flies
+         the landing circuit.
+  6. 30-Second Auto-Disarm Delay on Stop:
      Once the aircraft completes rollout and comes to a full stop on the runway,
      a 30-second countdown begins. If the pilot remains in GUIDED mode, the aircraft
      automatically disarms after 30 seconds. If the pilot switches flight modes,
@@ -66,12 +72,9 @@ class Config:
     max_course_corr_deg: float = 20.0    # Maximum course correction angle [deg]
     hdg_accel_limit: float = 2.0         # Lateral acceleration limit [m/s^2]
 
-    # Speed Management
-    flare_aspd_margin: float = 0.5       # Target airspeed = AIRSPEED_MIN + this [m/s]
-
-    # Pilot Authority & Failsafes
-    go_around_thr_pwm: int = 1900        # RC throttle PWM threshold for go-around
-    throttle_channel: int = 3            # RC throttle channel
+    # Throttle Safety & Pilot Go-Around Authority
+    go_around_thr_pwm: int = 1800        # RC throttle PWM threshold for go-around (> 80% stick)
+    throttle_channel: int = 3            # RC throttle channel index
 
     # Rates
     cmd_hz: float = 10.0                 # Guidance command rate [Hz]
@@ -108,7 +111,7 @@ class MissionApproachGeometry:
     glideslope_deg: float            # Approach glide slope angle [deg]
     glideslope_gradient: float       # Glide slope gradient (tan gamma)
     do_land_start_seq: Optional[int] # Sequence index of MAV_CMD_DO_LAND_START (if present)
-    do_land_start_next_seq: Optional[int] # First NAV waypoint after DO_LAND_START
+    do_land_start_next_seq: Optional[int] # Sequence index of waypoint immediately after DO_LAND_START
     takeoff_alt_m: Optional[float]   # Planned takeoff / climbout altitude [m]
 
 
@@ -216,7 +219,7 @@ class Telemetry:
         return bool(hb.base_mode & mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED)
 
     def throttle_pwm(self) -> Optional[int]:
-        """Get RC transmitter throttle channel PWM value."""
+        """Get raw physical RC transmitter throttle channel PWM value."""
         rc = self.get('RC_CHANNELS', 1.0)
         if rc is None:
             return None
@@ -272,19 +275,34 @@ def extract_mission_geometry(master) -> MissionApproachGeometry:
     # 1. Search for DO_LAND_START item (command 189)
     do_land_start_idx = next((i for i, w in enumerate(wps)
                               if w.command == mavutil.mavlink.MAV_CMD_DO_LAND_START), None)
-    do_land_start_next_idx = (do_land_start_idx + 1) if (do_land_start_idx is not None and do_land_start_idx + 1 < len(wps)) else None
 
-    # 2. Search for NAV_TAKEOFF item (command 22) or read TKOFF_ALT param
+    # 2. Locate the navigation waypoint immediately after DO_LAND_START
+    do_land_start_next_idx = None
+    if do_land_start_idx is not None:
+        nav_commands = {
+            mavutil.mavlink.MAV_CMD_NAV_WAYPOINT,
+            mavutil.mavlink.MAV_CMD_NAV_SPLINE_WAYPOINT,
+            mavutil.mavlink.MAV_CMD_NAV_LOITER_TURNS,
+            mavutil.mavlink.MAV_CMD_NAV_LOITER_TIME,
+            mavutil.mavlink.MAV_CMD_NAV_LOITER_UNLIM,
+            mavutil.mavlink.MAV_CMD_NAV_TAKEOFF,
+        }
+        do_land_start_next_idx = next(
+            (i for i in range(do_land_start_idx + 1, len(wps)) if wps[i].command in nav_commands),
+            (do_land_start_idx + 1) if (do_land_start_idx + 1 < len(wps)) else None
+        )
+
+    # 3. Search for NAV_TAKEOFF item (command 22) or read TKOFF_ALT param
     takeoff_wp = next((w for w in wps if w.command == mavutil.mavlink.MAV_CMD_NAV_TAKEOFF), None)
     takeoff_alt = takeoff_wp.z if takeoff_wp is not None else fetch_param(master, 'TKOFF_ALT')
 
-    # 3. Locate NAV_LAND
+    # 4. Locate NAV_LAND
     land_idx = next((i for i, w in enumerate(wps)
                      if w.command == mavutil.mavlink.MAV_CMD_NAV_LAND), None)
     if land_idx is None or land_idx == 0:
         raise RuntimeError('Mission does not contain a NAV_LAND item with a preceding waypoint.')
 
-    # 4. Locate immediate NAV_WAYPOINT before NAV_LAND
+    # 5. Locate immediate NAV_WAYPOINT before NAV_LAND
     approach_wp_idx = next((i for i in range(land_idx - 1, -1, -1)
                             if wps[i].command == mavutil.mavlink.MAV_CMD_NAV_WAYPOINT), None)
     if approach_wp_idx is None:
@@ -339,6 +357,7 @@ def extract_mission_geometry(master) -> MissionApproachGeometry:
     print(f' -> Mission Land Seq       : #{geom.land_seq}')
     print(f' -> Approach Waypoint Seq  : #{geom.approach_wp_seq}')
     print(f' -> DO_LAND_START Sequence : {"#" + str(geom.do_land_start_seq) if geom.do_land_start_seq is not None else "(none found)"}')
+    print(f' -> Go-Around Target WP    : {"#" + str(geom.do_land_start_next_seq) if geom.do_land_start_next_seq is not None else "(default)"}')
     print(f' -> Planned Takeoff Alt    : {geom.takeoff_alt_m:.1f} m' if geom.takeoff_alt_m else ' -> Planned Takeoff Alt    : (default)')
     print(f' -> Approach Leg Distance  : {geom.approach_dist_m:.1f} m')
     print(f' -> Approach Alt Drop      : {geom.approach_alt_drop_m:.1f} m')
@@ -399,7 +418,6 @@ def build_dynamic_exponential_profile(master, geom: MissionApproachGeometry) -> 
     h_flare_backup_floor = flare_alt_backup
 
     # Final Decided Flare Initiation Height:
-    # On steep descents, h_flare_accel scales up to prevent pitch acceleration spikes.
     h_flare = max(h_flare_accel, h_flare_time, h_flare_backup_floor)
 
     # Resulting Nominal Time Constant and Trajectory Geometry:
@@ -456,25 +474,14 @@ def cross_track_m(lat_deg: float, lon_deg: float, track_rad: float,
 
 def compute_live_exponential_trajectory(t_elapsed: float, h_0: float, hdot_0: float,
                                        hdot_td: float, max_vert_acc: float) -> Tuple[float, float, float]:
-    """Compute continuous exponential flare trajectory anchored to live initial conditions (h_0, hdot_0).
-
-    Guarantees:
-      1. h_ref(0) = h_0        (zero position jump)
-      2. hdot_ref(0) = hdot_0  (zero velocity jump)
-      3. a_z(0) <= max_vert_acc (acceleration bounded by TECS_VERT_ACC)
-
-    Returns:
-      (h_ref, hdot_ref, a_z)
-    """
+    """Compute continuous exponential flare trajectory anchored to live initial conditions (h_0, hdot_0)."""
     abs_hdot_0 = max(abs(hdot_td) + 0.1, abs(hdot_0))
     abs_hdot_td = abs(hdot_td)
 
-    # Ensure time constant satisfies acceleration bound
     tau_accel = abs_hdot_0 / max_vert_acc
     tau_geom = h_0 / (abs_hdot_0 - abs_hdot_td)
     tau = max(tau_accel, tau_geom)
 
-    # Asymptotic depth
     h_infty = -tau * abs_hdot_td
 
     decay = math.exp(-t_elapsed / tau)
@@ -486,11 +493,7 @@ def compute_live_exponential_trajectory(t_elapsed: float, h_0: float, hdot_0: fl
 
 
 def send_target_altitude(master, alt_target_m: float):
-    """Command TECS target altitude in GUIDED mode without slew resets.
-
-    Setting param3 = 0 updates guided_state.target_alt directly, allowing TECS's
-    internal energy balance and pitch damping loops to smoothly track the trajectory.
-    """
+    """Command TECS target altitude in GUIDED mode without slew resets."""
     master.mav.command_int_send(
         master.target_system, master.target_component,
         mavutil.mavlink.MAV_FRAME_GLOBAL_RELATIVE_ALT,
@@ -546,19 +549,29 @@ def set_mission_current(master, seq: int):
 
 
 def execute_go_around(master, geom: MissionApproachGeometry, thr_pwm: int):
-    """Execute a clean mission-aware go-around to DO_LAND_START in AUTO mode."""
-    if geom.do_land_start_seq is not None:
+    """Execute a clean mission-aware go-around to the waypoint after DO_LAND_START in AUTO mode."""
+    target_seq = None
+    target_desc = ""
+
+    if geom.do_land_start_next_seq is not None:
+        target_seq = geom.do_land_start_next_seq
+        target_desc = f"Waypoint after DO_LAND_START (seq #{target_seq})"
+    elif geom.do_land_start_seq is not None:
         target_seq = geom.do_land_start_seq
-        print(f'\n[!] GO-AROUND (throttle {thr_pwm} us): Setting mission current to DO_LAND_START (seq #{target_seq}) -> Switching to AUTO mode')
-        set_mission_current(master, target_seq)
-        set_mode(master, MODE_AUTO)
+        target_desc = f"DO_LAND_START (seq #{target_seq})"
     elif geom.approach_wp_seq is not None:
         target_seq = geom.approach_wp_seq
-        print(f'\n[!] GO-AROUND (throttle {thr_pwm} us): Setting mission current to approach WP (seq #{target_seq}) -> Switching to AUTO mode')
+        target_desc = f"Approach Waypoint (seq #{target_seq})"
+
+    if target_seq is not None:
+        print(f"\n[!] GO-AROUND TRIGGERED (Throttle: {thr_pwm} us > {CFG.go_around_thr_pwm} us):")
+        print(f" -> Setting active mission item to: {target_desc}")
+        print(f" -> Switching flight mode to: AUTO")
         set_mission_current(master, target_seq)
+        time.sleep(0.05)
         set_mode(master, MODE_AUTO)
     else:
-        print(f'\n[!] GO-AROUND (throttle {thr_pwm} us): No DO_LAND_START in mission -> Switching to AUTO mode')
+        print(f"\n[!] GO-AROUND TRIGGERED (Throttle: {thr_pwm} us): Switching to AUTO mode")
         set_mode(master, MODE_AUTO)
 
 
@@ -585,13 +598,6 @@ def main():
     telem = Telemetry(master)
     telem.request_streams()
 
-    # Query minimum stall airspeed for throttle management
-    aspd_min = fetch_param(master, 'AIRSPEED_MIN')
-    if aspd_min is None:
-        aspd_min = fetch_param(master, 'ARSPD_FBW_MIN')
-    flare_aspd = (aspd_min + CFG.flare_aspd_margin) if aspd_min else None
-    print(f'\n[3/3] Flare Airspeed Setpoint: {flare_aspd:.1f} m/s' if flare_aspd else 'Flare Airspeed: (default)')
-
     state = 'WAIT_APPROACH'
     flare_start_time = None
     flare_h0 = None
@@ -611,9 +617,9 @@ def main():
         gpi = telem.get('GLOBAL_POSITION_INT')
         mode = telem.mode()
 
-        # --------------------------------------------------------------------
+        # ----------------------------------------------------------------
         # Pilot Authority: Go-Around & Mode Override Check
-        # --------------------------------------------------------------------
+        # ----------------------------------------------------------------
         if state in ('FLARE', 'ROLLOUT', 'STOPPED'):
             thr = telem.throttle_pwm()
             if thr is not None and thr > CFG.go_around_thr_pwm:
@@ -632,9 +638,9 @@ def main():
             else:
                 non_guided_since = None
 
-        # --------------------------------------------------------------------
+        # ----------------------------------------------------------------
         # State: WAIT_APPROACH
-        # --------------------------------------------------------------------
+        # ----------------------------------------------------------------
         if state == 'WAIT_APPROACH':
             mc = telem.get('MISSION_CURRENT')
             on_final = (mode == MODE_AUTO and mc is not None and mc.seq == geom.land_seq)
@@ -660,19 +666,19 @@ def main():
                     state = 'ABORT'
                     break
 
-                if flare_aspd is not None:
-                    send_airspeed(master, flare_aspd)
+                # Command zero airspeed setpoint to TECS (throttle to idle)
+                send_airspeed(master, 0.0)
 
                 # Seed centerline heading immediately
                 send_course(master, geom.track_deg)
 
                 flare_start_time = time.time()
                 state = 'FLARE'
-                print('Smooth acceleration-bounded exponential flare active.')
+                print('Smooth acceleration-bounded exponential flare active (Throttle at IDLE).')
 
-        # --------------------------------------------------------------------
+        # ----------------------------------------------------------------
         # State: FLARE (Acceleration-Bounded Trajectory Tracking)
-        # --------------------------------------------------------------------
+        # ----------------------------------------------------------------
         elif state == 'FLARE':
             if (now - last_cmd_time) >= (1.0 / CFG.cmd_hz) and gpi is not None and agl is not None:
                 t_elapsed = now - flare_start_time
@@ -684,7 +690,10 @@ def main():
                 # 1. Vertical Guidance: Stream smooth reference altitude
                 send_target_altitude(master, h_ref)
 
-                # 2. Lateral Guidance: Cross-track correction to runway centerline
+                # 2. Throttle Management: Keep airspeed demand at 0.0 m/s (idle)
+                send_airspeed(master, 0.0)
+
+                # 3. Lateral Guidance: Cross-track correction to runway centerline
                 lat_cur = gpi.lat / 1e7
                 lon_cur = gpi.lon / 1e7
                 xtk = cross_track_m(lat_cur, lon_cur, geom.track_rad, geom.land_lat, geom.land_lon)
@@ -699,10 +708,13 @@ def main():
 
                 last_cmd_time = now
 
-                # Telemetry printout (1 Hz)
+                # Telemetry printout (1 Hz) with live pilot throttle monitoring
                 if (now - last_print_time) >= 1.0:
+                    thr_live = telem.throttle_pwm()
+                    thr_str = f"{thr_live}us" if thr_live is not None else "N/A"
                     print(f't: {t_elapsed:4.1f}s | AGL: {agl:5.2f}m | h_ref: {h_ref:5.2f}m | '
-                          f'hdot_ref: {hdot_ref:5.2f}m/s | az: {accel_ref:4.2f}m/s^2 | Vg: {vg:4.1f}m/s | XTK: {xtk:+5.1f}m')
+                          f'hdot_ref: {hdot_ref:5.2f}m/s | az: {accel_ref:4.2f}m/s^2 | '
+                          f'Thr_Stick: {thr_str} | Vg: {vg:4.1f}m/s | XTK: {xtk:+5.1f}m')
                     last_print_time = now
 
             # Touchdown detection
@@ -710,13 +722,14 @@ def main():
                 print(f'\nTouchdown detected (AGL {agl:.2f} m) -> Entering ROLLOUT')
                 state = 'ROLLOUT'
 
-        # --------------------------------------------------------------------
+        # ----------------------------------------------------------------
         # State: ROLLOUT (Holding Ground Track until Stopped)
-        # --------------------------------------------------------------------
+        # ----------------------------------------------------------------
         elif state == 'ROLLOUT':
             if (now - last_cmd_time) >= (1.0 / CFG.cmd_hz):
-                # Hold down on runway (target altitude 0.0m) and maintain centerline
+                # Hold down on runway (target altitude 0.0m), keep centerline, and hold 0 airspeed demand
                 send_target_altitude(master, 0.0)
+                send_airspeed(master, 0.0)
                 send_course(master, geom.track_deg)
                 last_cmd_time = now
 
@@ -731,13 +744,14 @@ def main():
                 else:
                     state = 'DONE'
 
-        # --------------------------------------------------------------------
+        # ----------------------------------------------------------------
         # State: STOPPED (30-Second Auto-Disarm Countdown in GUIDED Mode)
-        # --------------------------------------------------------------------
+        # ----------------------------------------------------------------
         elif state == 'STOPPED':
             if (now - last_cmd_time) >= (1.0 / CFG.cmd_hz):
-                # Keep holding 0.0m altitude demand and runway heading
+                # Keep holding 0.0m altitude demand, 0 airspeed demand, and runway heading
                 send_target_altitude(master, 0.0)
+                send_airspeed(master, 0.0)
                 send_course(master, geom.track_deg)
                 last_cmd_time = now
 
