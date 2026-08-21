@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-Test 2: 5-Second 1 m/s Guided Descent & Auto-Release (Hardware Serial)
+Test 2 (SITL): 5-Second 1 m/s Guided Descent & Auto-Release (SITL UDP)
 ======================================================================
 Purpose:
-  Safely test GUIDED mode vertical rate control on a real aircraft (Cube Orange+ / ArduPlane).
+  Safely test GUIDED mode vertical rate control in SITL simulation (ArduPlane).
   Commands a smooth 1.0 m/s descent for exactly 5.0 seconds, then immediately
   releases control and restores the aircraft's previous flight mode (e.g. AUTO, FBWA, CRUISE).
 
@@ -26,13 +26,14 @@ Safety Interlocks:
      Strict timer releases control after 5.0 seconds of descent.
 
 Usage Examples:
-  # Default (Connects to /dev/ttyACM0 @ 115200 baud):
-  python3 test_guided_descent_5s.py
+  # SITL Default (UDP 14550):
+  python3 test_guided_descent_5s_sitl.py
 
-  # Custom Serial Port:
-  python3 test_guided_descent_5s.py --connect /dev/ttyUSB0 --baud 115200
-  python3 test_guided_descent_5s.py --connect /dev/ttyAMA0 --baud 921600
-  python3 test_guided_descent_5s.py --connect /dev/ttyACM0 --release-mode AUTO
+  # Custom UDP / TCP Port:
+  python3 test_guided_descent_5s_sitl.py --connect udp:127.0.0.1:14550
+  python3 test_guided_descent_5s_sitl.py --connect udpin:0.0.0.0:14550
+  python3 test_guided_descent_5s_sitl.py --connect tcp:127.0.0.1:5762
+  python3 test_guided_descent_5s_sitl.py --release-mode AUTO
 """
 
 import argparse
@@ -43,9 +44,8 @@ from typing import Optional
 
 from pymavlink import mavutil
 
-# Default Connection Settings for Real Aircraft Hardware
-DEVICE = "/dev/ttyACM0"
-BAUD = 115200
+# Default Connection Settings for SITL (UDP)
+SITL_CONNECTION = "udp:127.0.0.1:14550"
 
 # ArduPlane Flight Modes
 MODE_MANUAL = 0
@@ -224,9 +224,9 @@ def send_target_heading(master, heading_deg: float):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Execute a 5-second 1 m/s descent test in GUIDED mode and release control (Hardware Serial).")
-    parser.add_argument("--connect", default=DEVICE, help=f"MAVLink connection string (e.g. {DEVICE}, /dev/ttyUSB0, default: {DEVICE})")
-    parser.add_argument("--baud", type=int, default=BAUD, help=f"Serial baud rate (default: {BAUD})")
+    parser = argparse.ArgumentParser(description="Execute a 5-second 1 m/s descent test in GUIDED mode (SITL UDP) and release control.")
+    parser.add_argument("--connect", default=SITL_CONNECTION, help=f"MAVLink connection string (e.g. {SITL_CONNECTION}, udpin:0.0.0.0:14550, tcp:127.0.0.1:5762, default: {SITL_CONNECTION})")
+    parser.add_argument("--baud", type=int, default=115200, help="Serial baud rate (if serial port, default: 115200)")
     parser.add_argument("--descent-rate", type=float, default=1.0, help="Descent rate in m/s (default 1.0 m/s)")
     parser.add_argument("--duration", type=float, default=5.0, help="Descent duration in seconds (default 5.0 s)")
     parser.add_argument("--go-around-thr", type=int, default=1800, help="Pilot throttle PWM abort threshold (default 1800 us)")
@@ -237,7 +237,7 @@ def main():
 
     print("=" * 72)
     print("   5-Second 1 m/s GUIDED Mode Descent Test & Auto-Release          ")
-    print("   [Hardware Serial Configuration: Cube Orange+ / ArduPlane]       ")
+    print("   [SITL UDP Configuration: ArduPlane Simulation]                  ")
     print("=" * 72)
     print(f"Connection String  : {args.connect} (baud={args.baud})")
     print(f"Target Sink Rate   : {args.descent_rate:.1f} m/s")
