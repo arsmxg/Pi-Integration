@@ -45,7 +45,7 @@ from typing import Optional
 from pymavlink import mavutil
 
 # Default Connection Settings for SITL (UDP)
-SITL_CONNECTION = "udp:127.0.0.1:14550"
+SITL_CONNECTION = 'tcp:127.0.0.1:5762'
 
 # ArduPlane Flight Modes
 MODE_MANUAL = 0
