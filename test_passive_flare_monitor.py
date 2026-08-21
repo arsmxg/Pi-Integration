@@ -16,17 +16,21 @@ Purpose:
     6. Optional CSV flight-data logging for post-flight telemetry overlay.
 
 Usage Examples:
+  # Default (Connects to /dev/ttyACM0 @ 115200 baud, logs live flight data to passive_test.csv):
+  python3 test_passive_flare_monitor.py
+
   # SITL Passive Monitor:
   python3 test_passive_flare_monitor.py --connect tcp:127.0.0.1:5762
 
-  # Real Aircraft Passive Monitor:
+  # Custom Serial Port / Custom Log:
   python3 test_passive_flare_monitor.py --connect /dev/ttyUSB0 --baud 115200
-  python3 test_passive_flare_monitor.py --connect /dev/ttyAMA0 --baud 921600 --log-csv flare_shadow_log.csv
+  python3 test_passive_flare_monitor.py --connect /dev/ttyAMA0 --baud 921600 --log-csv custom_flight_log.csv
 """
 
 import argparse
 import csv
 import math
+import os
 import sys
 import time
 from dataclasses import dataclass
@@ -72,13 +76,18 @@ PLANE_MODES = {
     25: "LOITER_ALT_QLAND",
 }
 
+# Default Connection & Logging Settings
+DEVICE = "/dev/ttyACM0"
+BAUD = 115200
+DEFAULT_CSV_LOG = "passive_test.csv"
+
 R_EARTH = 6378137.0
 
 
 @dataclass
 class Config:
-    connection: str = 'tcp:127.0.0.1:5762'
-    baud: int = 115200
+    connection: str = DEVICE
+    baud: int = BAUD
 
     # Autopilot Defaults / Fallbacks
     default_vert_acc: float = 1.5         # Max vertical acceleration [m/s^2] (TECS_VERT_ACC)
@@ -225,6 +234,27 @@ class Telemetry:
     def throttle_pwm(self) -> Optional[int]:
         rc = self.get('RC_CHANNELS', 1.0)
         return getattr(rc, f'chan{self.throttle_channel}_raw', None) if rc is not None else None
+
+    def roll_deg(self) -> Optional[float]:
+        att = self.get('ATTITUDE', 1.0)
+        return math.degrees(att.roll) if att is not None else None
+
+    def pitch_deg(self) -> Optional[float]:
+        att = self.get('ATTITUDE', 1.0)
+        return math.degrees(att.pitch) if att is not None else None
+
+    def heading_deg(self) -> Optional[float]:
+        hud = self.get('VFR_HUD', 1.0)
+        if hud is not None:
+            return float(hud.heading)
+        gpi = self.get('GLOBAL_POSITION_INT')
+        return (gpi.hdg / 100.0) if (gpi is not None and gpi.hdg != 65535) else None
+
+    def lat_lon(self) -> Tuple[Optional[float], Optional[float]]:
+        gpi = self.get('GLOBAL_POSITION_INT', 1.0)
+        if gpi is not None and (gpi.lat != 0 or gpi.lon != 0):
+            return gpi.lat / 1e7, gpi.lon / 1e7
+        return None, None
 
 
 def fetch_param(master, name: str, timeout: float = 2.0) -> Optional[float]:
@@ -452,13 +482,26 @@ def compute_live_exponential_trajectory(t_elapsed: float, h_0: float, hdot_0: fl
     return max(0.0, h_ref), hdot_ref, accel_ref
 
 
+def get_unique_filename(base_path: str = "passive_test.csv") -> str:
+    """Generate a unique filename by appending an incrementing index if the file exists."""
+    if not os.path.exists(base_path):
+        return base_path
+    root, ext = os.path.splitext(base_path)
+    counter = 1
+    while True:
+        candidate = f"{root}_{counter}{ext}"
+        if not os.path.exists(candidate):
+            return candidate
+        counter += 1
+
+
 def main():
     parser = argparse.ArgumentParser(description="Passive shadow monitor for exponential flare controller.")
-    parser.add_argument("--connect", default="tcp:127.0.0.1:5762", help="MAVLink connection string (e.g. /dev/ttyUSB0, /dev/ttyAMA0, tcp:127.0.0.1:5762)")
-    parser.add_argument("--baud", type=int, default=115200, help="Serial baud rate (if serial port)")
+    parser.add_argument("--connect", default=DEVICE, help=f"MAVLink connection string (e.g. {DEVICE}, tcp:127.0.0.1:5762, default: {DEVICE})")
+    parser.add_argument("--baud", type=int, default=BAUD, help=f"Serial baud rate (if serial port, default: {BAUD})")
     parser.add_argument("--go-around-thr", type=int, default=1800, help="Pilot throttle PWM threshold for go-around (default 1800 us)")
     parser.add_argument("--throttle-ch", type=int, default=3, help="Throttle RC channel (default 3)")
-    parser.add_argument("--log-csv", default=None, help="Optional CSV output file path to log live shadow telemetry")
+    parser.add_argument("--log-csv", default=DEFAULT_CSV_LOG, help=f"CSV output file path (default: {DEFAULT_CSV_LOG}, auto-increments if file exists)")
     args = parser.parse_args()
 
     cfg = Config(
@@ -494,15 +537,22 @@ def main():
     # CSV Logger Setup
     csv_file = None
     csv_writer = None
+    actual_csv_path = None
     if args.log_csv:
-        csv_file = open(args.log_csv, mode='w', newline='')
+        actual_csv_path = get_unique_filename(args.log_csv)
+        csv_file = open(actual_csv_path, mode='w', newline='')
         csv_writer = csv.writer(csv_file)
         csv_writer.writerow([
-            'timestamp', 'state', 'mode', 'mission_seq', 'agl_m', 'vz_mps',
-            'h_ref_m', 'hdot_ref_mps', 'az_ref_mps2', 'alt_err_m', 'sink_err_mps',
-            'xtk_m', 'target_course_deg', 'thr_pwm', 'groundspeed_mps', 'airspeed_mps'
+            'timestamp', 'state', 'mode', 'mission_seq',
+            'lat', 'lon', 'agl_m', 'vz_mps',
+            'roll_deg', 'pitch_deg', 'heading_deg',
+            'groundspeed_mps', 'airspeed_mps', 'thr_pwm',
+            'xtk_m', 'target_course_deg',
+            'h_ref_m', 'hdot_ref_mps', 'az_ref_mps2',
+            'alt_err_m', 'sink_err_mps'
         ])
-        print(f"\n[i] Telemetry logging enabled -> {args.log_csv}")
+        csv_file.flush()
+        print(f"\n[i] Telemetry logging enabled -> {actual_csv_path}")
 
     state = 'WAIT_APPROACH'
     flare_start_time = None
@@ -532,6 +582,27 @@ def main():
             vz = telem.vertical_velocity()
             vg = telem.groundspeed() or cfg.default_approach_speed
             ias = telem.airspeed()
+            roll = telem.roll_deg()
+            pitch = telem.pitch_deg()
+            hdg = telem.heading_deg()
+            lat_cur, lon_cur = telem.lat_lon()
+
+            # Cross-track & lateral course calculations (All States)
+            xtk = 0.0
+            target_course_deg = geom.track_deg
+            if lat_cur is not None and lon_cur is not None:
+                xtk = cross_track_m(lat_cur, lon_cur, geom.track_rad, geom.land_lat, geom.land_lon)
+                v_close = max(-cfg.v_close_max, min(-xtk / cfg.t_intercept, cfg.v_close_max))
+                corr_rad = math.asin(max(-0.5, min(v_close / max(vg, 5.0), 0.5)))
+                max_corr = math.radians(cfg.max_course_corr_deg)
+                corr_rad = max(-max_corr, min(corr_rad, max_corr))
+                target_course_deg = (math.degrees(geom.track_rad + corr_rad) + 360.0) % 360.0
+
+            h_ref = None
+            hdot_ref = None
+            accel_ref = None
+            alt_err = None
+            sink_err = None
 
             # ----------------------------------------------------------------
             # 1. Mode Change Monitoring (All States)
@@ -540,7 +611,7 @@ def main():
                 old_str = PLANE_MODES.get(last_mode, str(last_mode))
                 print(f"\n[SHADOW DETECT] >>> Flight mode changed: {old_str} -> {mode_name}")
                 if state in ('SHADOW_FLARE', 'SHADOW_ROLLOUT', 'SHADOW_STOPPED'):
-                    print(f"[SHADOW DETECT] -> Flare controller would STAND DOWN due to pilot mode change.")
+                    print(f"[SHADOW DETECT] -> Flare controller would abort due to pilot mode change.")
             last_mode = mode_num
 
             # ----------------------------------------------------------------
@@ -550,8 +621,8 @@ def main():
                 target_seq = geom.do_land_start_next_seq or geom.do_land_start_seq or geom.approach_wp_seq
                 print(f"\n[SHADOW DETECT] >>> PILOT THROTTLE ADVANCE DETECTED (Throttle: {thr} us > {cfg.go_around_thr_pwm} us)")
                 print(f" [PASSIVE SIMULATION]:")
-                print(f"  -> WOULD set active mission item to: Seq #{target_seq}")
-                print(f"  -> WOULD switch flight mode to: AUTO")
+                print(f"  -> Simulated set active mission item to: Seq #{target_seq}")
+                print(f"  -> Simulated switch flight mode to: AUTO")
                 print(f"  -> [PASSIVE: Zero commands sent to autopilot]")
                 time.sleep(0.5)
 
@@ -567,13 +638,13 @@ def main():
                     live_vz = vz if (vz is not None and vz < -0.2) else profile.hdot_approach
                     flare_hdot0 = live_vz
                     flare_start_time = now
-                    state = 'SHADOW_FLARE'
+                    state = 'SIM_FLARE'
 
                     print(f"\n[SHADOW DETECT] >>> FLARE TRIGGER CRITERIA MET at AGL {flare_h0:.2f} m (live sink: {flare_hdot0:.2f} m/s)")
                     print(f" [PASSIVE SIMULATION]:")
-                    print(f"  -> WOULD switch flight mode to: GUIDED")
-                    print(f"  -> WOULD set airspeed setpoint to: 0.0 m/s (Idle Throttle)")
-                    print(f"  -> WOULD command runway track bearing: {geom.track_deg:.1f}°")
+                    print(f"  -> Simulated switch flight mode to: GUIDED")
+                    print(f"  -> Simulated set airspeed setpoint to: 0.0 m/s (Idle Throttle)")
+                    print(f"  -> Simulated command runway track bearing: {geom.track_deg:.1f}°")
                     print(f"  -> [PASSIVE: Maintaining read-only monitoring]")
                     print("-" * 72)
                     print(f" {'t(s)':<5} | {'Live AGL':<9} | {'h_ref':<8} | {'AltErr':<7} | {'Live Vz':<9} | {'hdot_ref':<9} | {'az_ref':<8} | {'XTK':<7} | {'Thr'}")
@@ -596,45 +667,23 @@ def main():
                 h_ref, hdot_ref, accel_ref = compute_live_exponential_trajectory(
                     t_elapsed, flare_h0, flare_hdot0, profile.hdot_td, profile.max_vert_acc
                 )
-
-                # Cross-track & lateral course calculations
-                xtk = 0.0
-                target_course_deg = geom.track_deg
-                if gpi is not None:
-                    lat_cur = gpi.lat / 1e7
-                    lon_cur = gpi.lon / 1e7
-                    xtk = cross_track_m(lat_cur, lon_cur, geom.track_rad, geom.land_lat, geom.land_lon)
-                    v_close = max(-cfg.v_close_max, min(-xtk / cfg.t_intercept, cfg.v_close_max))
-                    corr_rad = math.asin(max(-0.5, min(v_close / max(vg, 5.0), 0.5)))
-                    max_corr = math.radians(cfg.max_course_corr_deg)
-                    corr_rad = max(-max_corr, min(corr_rad, max_corr))
-                    target_course_deg = (math.degrees(geom.track_rad + corr_rad) + 360.0) % 360.0
-
-                alt_err = (agl - h_ref) if agl is not None else 0.0
-                sink_err = (vz - hdot_ref) if vz is not None else 0.0
+                alt_err = (agl - h_ref) if (agl is not None and h_ref is not None) else None
+                sink_err = (vz - hdot_ref) if (vz is not None and hdot_ref is not None) else None
 
                 # Print trajectory comparison at 1 Hz
                 if (now - last_print_time) >= 1.0:
                     agl_str = f"{agl:6.2f}m" if agl is not None else "  N/A  "
                     vz_str = f"{vz:6.2f}m/s" if vz is not None else "  N/A  "
                     thr_str = f"{thr}us" if thr is not None else "N/A"
-                    print(f" {t_elapsed:4.1f}s | {agl_str:<9} | {h_ref:6.2f}m | {alt_err:+6.2f}m | {vz_str:<9} | {hdot_ref:6.2f}m/s | {accel_ref:5.2f}m/s² | {xtk:+5.1f}m | {thr_str}")
+                    alt_err_str = f"{alt_err:+6.2f}m" if alt_err is not None else "  N/A  "
+                    print(f" {t_elapsed:4.1f}s | {agl_str:<9} | {h_ref:6.2f}m | {alt_err_str} | {vz_str:<9} | {hdot_ref:6.2f}m/s | {accel_ref:5.2f}m/s² | {xtk:+5.1f}m | {thr_str}")
                     last_print_time = now
-
-                # CSV Log
-                if csv_writer:
-                    csv_writer.writerow([
-                        f"{now:.3f}", state, mode_name, mc_seq, agl, vz,
-                        round(h_ref, 2), round(hdot_ref, 2), round(accel_ref, 2),
-                        round(alt_err, 2), round(sink_err, 2), round(xtk, 1),
-                        round(target_course_deg, 1), thr, vg, ias
-                    ])
 
                 # Touchdown detection
                 if agl is not None and agl <= cfg.touchdown_agl:
                     print(f"\n[SHADOW DETECT] >>> Touchdown detected (AGL {agl:.2f} m <= {cfg.touchdown_agl:.2f} m) -> Entering SHADOW_ROLLOUT")
                     print(f" [PASSIVE SIMULATION]:")
-                    print(f"  -> WOULD command runway heading hold ({geom.track_deg:.1f}°) and 0m altitude")
+                    print(f"  -> Simulated command runway heading hold ({geom.track_deg:.1f}°) and 0m altitude")
                     state = 'SHADOW_ROLLOUT'
 
             # ----------------------------------------------------------------
@@ -674,17 +723,48 @@ def main():
                     state = 'DONE'
                     break
 
+            # ----------------------------------------------------------------
+            # CSV Telemetry Logging (All States)
+            # ----------------------------------------------------------------
+            if csv_writer:
+                csv_writer.writerow([
+                    f"{now:.3f}",
+                    state,
+                    mode_name,
+                    mc_seq if mc_seq is not None else "",
+                    f"{lat_cur:.7f}" if lat_cur is not None else "",
+                    f"{lon_cur:.7f}" if lon_cur is not None else "",
+                    f"{agl:.2f}" if agl is not None else "",
+                    f"{vz:.2f}" if vz is not None else "",
+                    f"{roll:.1f}" if roll is not None else "",
+                    f"{pitch:.1f}" if pitch is not None else "",
+                    f"{hdg:.1f}" if hdg is not None else "",
+                    f"{vg:.2f}" if vg is not None else "",
+                    f"{ias:.2f}" if ias is not None else "",
+                    thr if thr is not None else "",
+                    f"{xtk:.2f}" if xtk is not None else "",
+                    f"{target_course_deg:.1f}" if target_course_deg is not None else "",
+                    f"{h_ref:.2f}" if h_ref is not None else "",
+                    f"{hdot_ref:.2f}" if hdot_ref is not None else "",
+                    f"{accel_ref:.2f}" if accel_ref is not None else "",
+                    f"{alt_err:.2f}" if alt_err is not None else "",
+                    f"{sink_err:.2f}" if sink_err is not None else "",
+                ])
+                csv_file.flush()
+
             time.sleep(1.0 / cfg.loop_hz)
 
     except KeyboardInterrupt:
         print("\n[!] Passive monitor stopped by user.")
     finally:
         if csv_file:
+            csv_file.flush()
             csv_file.close()
-            print(f"[i] Telemetry log saved to {args.log_csv}")
+            print(f"[i] Telemetry log saved to {actual_csv_path}")
 
     print(f"\nPassive shadow monitor finished. Final state: {state}")
 
 
 if __name__ == '__main__':
     main()
+
