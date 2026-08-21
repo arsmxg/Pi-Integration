@@ -277,16 +277,16 @@ def main():
     saved_target_wp = telem.current_waypoint()
 
     if initial_agl is None or initial_mode_num is None:
-        print("[!] ERROR: Failed to receive relative altitude or flight mode from autopilot.")
+        print("ERROR: Failed to receive relative altitude or flight mode from autopilot.")
         sys.exit(1)
 
-    print(f"\n[PRE-CHECK INITIAL STATE]")
+    print(f"\nCHECK INITIAL STATE]")
     print(f" -> Initial Flight Mode : {initial_mode_name} (Mode #{initial_mode_num})")
     if saved_target_wp is not None:
-        print(f" -> Active Target WP    : WP #{saved_target_wp} (will restore upon return to AUTO)")
-    print(f" -> Starting Altitude   : {initial_agl:.2f} m AGL")
-    print(f" -> Initial Heading     : {initial_hdg:.1f}°")
-    print(f" -> Armed Status        : {'ARMED' if telem.is_armed() else 'DISARMED'}")
+        print(f"Active Target WP    : WP #{saved_target_wp} (will restore upon return to AUTO)")
+    print(f"Starting Altitude   : {initial_agl:.2f} m AGL")
+    print(f"Initial Heading     : {initial_hdg:.1f}°")
+    print(f"Armed Status        : {'ARMED' if telem.is_armed() else 'DISARMED'}")
 
     # Determine handback flight mode
     if args.release_mode.upper() == "RESTORE":
@@ -298,7 +298,7 @@ def main():
             handback_mode_num = PLANE_NAME_TO_MODE[target_name]
             handback_mode_name = target_name
         else:
-            print(f"[!] Warning: Unknown release mode '{args.release_mode}'. Defaulting to initial mode {initial_mode_name}.")
+            print(f"Warning: Unknown release mode '{args.release_mode}'. Defaulting to initial mode {initial_mode_name}.")
             handback_mode_num = initial_mode_num
             handback_mode_name = initial_mode_name
 
@@ -306,13 +306,8 @@ def main():
     altitude_floor = initial_agl - 10.0
     expected_end_alt = initial_agl - (args.descent_rate * args.duration)
 
-    print(f" -> Dynamic Alt Floor   : {altitude_floor:.2f} m AGL (10.0 m below start altitude)")
-    print(f" -> Planned End Alt     : {expected_end_alt:.2f} m AGL")
-    print(f" -> Handback Target Mode: {handback_mode_name} (#{handback_mode_num})")
-    print("-" * 72)
-
     # Safety confirmation prompt / countdown
-    print("\n[!] Engaging GUIDED mode and starting 5-second descent...")
+    print("\nEngaging GUIDED mode and starting 5-second descent...")
 
     # Step 1: Engage GUIDED Mode
     set_flight_mode(master, MODE_GUIDED)
@@ -322,13 +317,11 @@ def main():
         time.sleep(0.02)
 
     if telem.mode() != MODE_GUIDED:
-        print("[!] ERROR: Flight controller failed to confirm GUIDED mode. Aborting test.")
+        print("ERROR: Flight controller failed to confirm GUIDED mode. Aborting test.")
         sys.exit(1)
 
-    print(f"[*] GUIDED mode confirmed! Test actively running for {args.duration:.1f}s.")
-    print("-" * 72)
+    print(f"GUIDED mode confirme: Running descent test.")
     print(f" {'t(s)':<6} | {'Target Alt':<11} | {'Live AGL':<10} | {'Sink Rate':<10} | {'Thr Stick':<10} | {'Mode'}")
-    print("-" * 72)
 
     # Step 2: Run 5-Second Descent Loop
     start_time = time.time()
@@ -353,7 +346,7 @@ def main():
 
         # Safety Check 1: Pilot RC Throttle Override
         if current_thr is not None and current_thr > args.go_around_thr:
-            abort_reason = f"Pilot Throttle Override detected ({current_thr} us > {args.go_around_thr} us)"
+            abort_reason = f"Pilot Throttle Override active ({current_thr} us > {args.go_around_thr} us)"
             break
 
         # Safety Check 2: Pilot Manual Mode Switch Override
@@ -390,21 +383,21 @@ def main():
     total_elapsed = time.time() - start_time
     print("-" * 72)
     if abort_reason:
-        print(f"\n[!] TEST ABORTED EARLY at t={total_elapsed:.2f}s: {abort_reason}")
+        print(f"\nTEST ABORTED at t={total_elapsed:.2f}s: {abort_reason}")
     else:
-        print(f"\n[+] 5.0-Second Descent Completed Successfully (Duration: {total_elapsed:.2f}s)!")
+        print(f"\nDescent test completed successfully (Duration: {total_elapsed:.2f}s)!")
 
     # Release control logic
     if abort_reason and "Pilot Mode Switch detected" in abort_reason:
-        print(f"[*] Standing down: Aircraft already in {PLANE_MODES.get(telem.mode(), telem.mode())} by pilot manual switch.")
+        print(f"Abort: Aircraft already in {PLANE_MODES.get(telem.mode(), telem.mode())} by pilot manual switch.")
     else:
         # If handback is AUTO and we have a remembered target waypoint, restore mission index first
         if handback_mode_num == MODE_AUTO and saved_target_wp is not None:
-            print(f"[*] Pre-setting active AUTO target waypoint to WP #{saved_target_wp}...")
+            print(f"Setting active AUTO target waypoint to WP #{saved_target_wp}...")
             set_mission_current(master, saved_target_wp)
             time.sleep(0.05)
 
-        print(f"[*] RELEASING CONTROL -> Switching flight mode to {handback_mode_name} (#{handback_mode_num})...")
+        print(f"Switching flight mode to {handback_mode_name} (#{handback_mode_num})...")
         set_flight_mode(master, handback_mode_num)
 
         # Re-send mission_set_current after mode change to guarantee active waypoint lock
@@ -425,23 +418,6 @@ def main():
     final_mode_num = telem.mode()
     final_mode_name = PLANE_MODES.get(final_mode_num, f"MODE_{final_mode_num}")
     final_wp = telem.current_waypoint()
-
-    print("\n" + "=" * 72)
-    print(" DESCENT TEST FLIGHT RESULTS SUMMARY")
-    print("=" * 72)
-    print(f" - Initial Altitude    : {initial_agl:.2f} m AGL")
-    print(f" - Final Altitude      : {final_agl:.2f} m AGL" if final_agl is not None else " - Final Altitude      : N/A")
-    if final_agl is not None:
-        delta_alt = initial_agl - final_agl
-        avg_sink = delta_alt / max(0.1, total_elapsed)
-        print(f" - Total Alt Drop      : {delta_alt:.2f} m (Target: {args.descent_rate * min(total_elapsed, args.duration):.2f} m)")
-        print(f" - Average Sink Rate   : {avg_sink:.2f} m/s (Target: {args.descent_rate:.2f} m/s)")
-    print(f" - Handback Flight Mode: Confirmed in {final_mode_name} (#{final_mode_num})")
-    if final_mode_num == MODE_AUTO and final_wp is not None:
-        wp_status = f" (WP #{saved_target_wp} preserved)" if final_wp == saved_target_wp else ""
-        print(f" - Active Target WP    : WP #{final_wp}{wp_status}")
-    print("=" * 72)
-    print("Test script finished. Aircraft control released.\n")
 
 
 if __name__ == "__main__":
