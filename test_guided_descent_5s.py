@@ -286,7 +286,6 @@ def main():
         print(f"Active Target WP    : WP #{saved_target_wp} (will restore upon return to AUTO)")
     print(f"Starting Altitude   : {initial_agl:.2f} m AGL")
     print(f"Initial Heading     : {initial_hdg:.1f}°")
-    print(f"Armed Status        : {'ARMED' if telem.is_armed() else 'DISARMED'}")
 
     # Determine handback flight mode
     if args.release_mode.upper() == "RESTORE":
